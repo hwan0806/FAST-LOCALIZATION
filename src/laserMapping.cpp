@@ -831,7 +831,7 @@ void load_file(ros::Publisher& global_map_pub)
  */
 void global_localization()
 {
-    ros::Rate rate(20);
+    ros::Rate rate(10);
     while (ros::ok())
     {
         std::unique_lock<std::mutex> lock_state(global_localization_finish_state_mutex);
@@ -881,13 +881,43 @@ void global_localization()
                 T_init_sc.block<3, 3>(0, 0) = Eigen::Matrix3d(yaw);
                 pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_init_sc);
                 ROS_INFO("Global match map id = %d", localization_id);
-                // Load Matching Map Frames and Status : pre-built map idx
+
+
+                // Load submap near the loop idx
                 PointCloudXYZI::Ptr current_loop_pc(new PointCloudXYZI);
-                pcl::io::loadPCDFile(data_root_dir + "Scans/" + padZeros(localization_id) + ".pcd", *current_loop_pc);  // gil : sc liosam format
+                int total_frame_num = pose_map.size();
+
+                // submap merging
+                int search_num = 2;     // TODO : gil : to yaml.
+                for (int i = -search_num; i < search_num; ++i) {
+                    int key_near_id = localization_id + i;
+                    if (key_near_id < 0 || key_near_id >= total_frame_num )
+                        continue;
+                    pcl::PointCloud<PointType>::Ptr key_near_pcd(new pcl::PointCloud<PointType>);
+                    pcl::io::loadPCDFile(data_root_dir + "Scans/" + padZeros(key_near_id) + ".pcd", *key_near_pcd);  // gil : sc liosam format
+
+                    Eigen::Vector3d p = position_map[key_near_id];
+                    Eigen::Quaterniond q = pose_map[key_near_id];
+
+                    Eigen::Matrix4d T_near = Eigen::Matrix4d::Identity();
+                    T_near.block<3, 3>(0, 0) = q.toRotationMatrix();
+                    T_near.block<3, 1>(0, 3) = p;
+
+                    pcl::transformPointCloud(*key_near_pcd, *key_near_pcd, T_near);
+                    *current_loop_pc += *key_near_pcd;
+                }
+
+                // TODO : current_loop_pc downsamplling!!!
+
                 Eigen::Vector3d p = position_map[localization_id];
                 Eigen::Quaterniond q = pose_map[localization_id];
 
-                Eigen::Matrix4d T_corr = Eigen::Matrix4d::Identity();
+                Eigen::Matrix4d T_or = Eigen::Matrix4d::Identity();
+                T_or.block<3, 3>(0, 0) = q.toRotationMatrix();
+                T_or.block<3, 1>(0, 3) = p;
+
+                Eigen::Matrix4d T_inv = T_or.inverse();
+                pcl::transformPointCloud(*current_loop_pc, *current_loop_pc, T_inv);
 
 
                 pcl::IterativeClosestPoint<PointType, PointType> icp;
@@ -905,9 +935,11 @@ void global_localization()
 
                 // TODO :  icp fitnessscore thresholding - 적절한 값이 무엇인가?!
                 std::cout << "icp score : " << icp.getFitnessScore() << std::endl;
-                if(icp.getFitnessScore() > 1.5)
+                if(icp.getFitnessScore() > 1.0)
                     continue;
 
+
+                Eigen::Matrix4d T_corr = Eigen::Matrix4d::Identity();
                 Eigen::Matrix4d T_corr_current = icp.getFinalTransformation().cast<double>();
                 pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_corr_current);
                 T_corr = T_corr_current * T_init_sc;
@@ -922,10 +954,6 @@ void global_localization()
                 T_corr = (T_corr_current * T_corr).eval();
 
                 cout << T_corr << endl;
-
-                Eigen::Matrix4d T_or = Eigen::Matrix4d::Identity();
-                T_or.block<3, 3>(0, 0) = q.toRotationMatrix();
-                T_or.block<3, 1>(0, 3) = p;
 
                 Eigen::Matrix4d T_i_l = Eigen::Matrix4d::Identity();
                 T_i_l.block<3, 3>(0, 0) = Lidar_R_wrt_IMU;
