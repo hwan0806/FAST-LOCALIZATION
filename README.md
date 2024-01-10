@@ -1,3 +1,10 @@
+## modified version for sc-lio-sam 
+**What you have to do is..**
+- update **data_root_dir** path in yaml  
+Data in data_root_dir(Scans and optimized_poses.txt) will be automatically loaded.
+<br>
+
+
 # FAST-LOCALIZATION
 **A LiDAR-Inertial localization package based on [FAST-LIO2](https://github.com/hku-mars/FAST_LIO), operating with a known prior map.**
 <p align="center">
