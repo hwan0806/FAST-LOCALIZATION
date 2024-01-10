@@ -1,4 +1,5 @@
 common:
+    data_root_dir: "/UbuntuSSD1/Inha/Keyframe/scout1/"           # gil : end of path should be "/"
     lid_topic:  "/ouster/points"
     imu_topic:  "/ouster/imu"
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible

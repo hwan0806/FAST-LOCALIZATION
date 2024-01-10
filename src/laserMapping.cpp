@@ -88,6 +88,7 @@ condition_variable sig_buffer;
 
 int localization_mode;
 string root_dir = ROOT_DIR;
+string data_root_dir;    // gil
 string map_file_path, lid_topic, imu_topic;
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -775,20 +776,42 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+// gil : for sc-lio-sam format
+std::string padZeros(int val, int num_digits = 6) {
+    std::ostringstream out;
+    out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
+    return out.str();
+}
+
 void load_file(ros::Publisher& global_map_pub)
 {
     fstream pose_file;
-    pose_file.open(root_dir + "map/pose.json");
-    double tx, ty, tz, w, x, y, z;
+    pose_file.open(data_root_dir + "optimized_poses.txt");   // gil : pose.json -> SC-LIO-SAM format
+//    double tx, ty, tz, w, x, y, z;
     int count = 0;
-    while(pose_file >> tx >> ty >> tz >> w >> x >> y >> z)
-    {
-        Eigen::Quaterniond q(w, x, y, z);
-        Eigen::Vector3d p(tx, ty, tz);
+
+    Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
+    std::string line;
+
+    while (std::getline(pose_file, line)) {
+        std::istringstream iss(line);
+        std::vector<double> values;
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 4; j++) {
+                double val;
+                iss >> val;
+                T_wl(i, j) = val;
+            }
+        }
+
+        Eigen::Matrix3d R_wl = T_wl.block<3,3>(0,0);
+        Eigen::Quaterniond q(R_wl);
+        Eigen::Vector3d p = T_wl.block<3,1>(0,3);
+
         position_map.push_back(p);
         pose_map.push_back(q);
         pcl::PointCloud<pcl::PointXYZINormal>::Ptr temp(new pcl::PointCloud<pcl::PointXYZINormal>);
-        pcl::io::loadPCDFile(root_dir + "map/pcd/" + to_string(count) + ".pcd", *temp);
+        pcl::io::loadPCDFile(data_root_dir + "Scans/" + padZeros(count) + ".pcd", *temp);
         scManager.makeAndSaveScancontextAndKeys(*temp);
         pcl::transformPointCloud(*temp, *temp, p, q);
         *global_map += *temp;
@@ -799,10 +822,13 @@ void load_file(ros::Publisher& global_map_pub)
         global_map_pub.publish(msg_global);
         count++;
     }
-    pose_file.close();
 
 }
 
+/*
+ * Initial pose estimation
+ * TODO : Add other lidar loc methods
+ */
 void global_localization()
 {
     ros::Rate rate(20);
@@ -815,9 +841,9 @@ void global_localization()
         if (global_localization_finish_state)
             continue;
 
-        // 初始化检查 两次成功初始化 位置增量小于阈值时通过检查
+        // Initialization check Two successful initializations Position increment less than threshold passes the check
         int init_check = 0;
-        // 重定位结果
+        // 연속적인 frame check
         std::vector<int> init_ids;
         std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> init_poses;
         while (init_check < 2)
@@ -827,9 +853,9 @@ void global_localization()
             lock_init_feats.unlock();
             if (N != 0)
             {
-                // 获得初始化阶段去畸变后的当前帧点云
+                // Get the current frame point cloud after de-distortion in the initialization phase
                 lock_init_feats.lock();
-                auto init_pair = init_feats_down_bodys.front();
+                auto init_pair = init_feats_down_bodys.front();     // init_pair : idx와 pointcloud 쌍
                 init_feats_down_bodys.pop();
                 lock_init_feats.unlock();
 
@@ -838,11 +864,12 @@ void global_localization()
                 PointCloudXYZI::Ptr current_init_pc(new PointCloudXYZI);
                 pcl::copyPointCloud(*current_init_pc_origin, *current_init_pc);
 
-                scManager.makeAndSaveScancontextAndKeys(*current_init_pc);
-                // 获得全局定位ID
+                scManager.makeAndSaveScancontextAndKeys(*current_init_pc);  // gil : inside of scManager, change SC setting
+                // Get global location ID & relative yaw
                 int localization_id = scManager.detectLoopClosureID().first;
                 float yaw_init = scManager.detectLoopClosureID().second;
 
+                // fail case : not detected
                 if (localization_id == -1)
                 {
                     init_check = 0;
@@ -854,9 +881,9 @@ void global_localization()
                 T_init_sc.block<3, 3>(0, 0) = Eigen::Matrix3d(yaw);
                 pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_init_sc);
                 ROS_INFO("Global match map id = %d", localization_id);
-                // 加载匹配地图帧 及 状态
+                // Load Matching Map Frames and Status : pre-built map idx
                 PointCloudXYZI::Ptr current_loop_pc(new PointCloudXYZI);
-                pcl::io::loadPCDFile(root_dir + "map/pcd/" + to_string(localization_id) + ".pcd", *current_loop_pc);
+                pcl::io::loadPCDFile(data_root_dir + "Scans/" + padZeros(localization_id) + ".pcd", *current_loop_pc);  // gil : sc liosam format
                 Eigen::Vector3d p = position_map[localization_id];
                 Eigen::Quaterniond q = pose_map[localization_id];
 
@@ -864,12 +891,23 @@ void global_localization()
 
 
                 pcl::IterativeClosestPoint<PointType, PointType> icp;
-                icp.setMaxCorrespondenceDistance(5);
+                // gil : change icp setting
+                icp.setMaxCorrespondenceDistance(150);  // TODO
+                icp.setMaximumIterations(100);
+                icp.setTransformationEpsilon(1e-6);
+                icp.setEuclideanFitnessEpsilon(1e-6);
+                icp.setRANSACIterations(0);
 
                 icp.setInputSource(current_init_pc);
                 icp.setInputTarget(current_loop_pc);
                 pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>);
                 icp.align(*unused);
+
+                // TODO :  icp fitnessscore thresholding - 적절한 값이 무엇인가?!
+                std::cout << "icp score : " << icp.getFitnessScore() << std::endl;
+                if(icp.getFitnessScore() > 1.5)
+                    continue;
+
                 Eigen::Matrix4d T_corr_current = icp.getFinalTransformation().cast<double>();
                 pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_corr_current);
                 T_corr = T_corr_current * T_init_sc;
@@ -937,6 +975,7 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
+    nh.param<string>("common/data_root_dir",data_root_dir,ROOT_DIR);    // gil
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
